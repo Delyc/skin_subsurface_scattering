@@ -1,207 +1,184 @@
+import os
+
 import numpy as np
 import taichi as ti
-import taichi.math as tm
-import os
+
+# This module creates fields at import time, so the runtime must already be
+# up. Guarding here means import order can't silently break the build.
+if ti.lang.impl.get_runtime().prog is None:
+    ti.init(arch=ti.gpu if ti._lib.core.with_cuda() else ti.cpu)
+
 from load_obj import load_obj, triangulate_faces
-from bvh import compute_centroids, build_bvh, flatten_bvh
-from helpers import (compute_face_normals, compute_vertex_normal, compute_tangents,
-                     find_boundary_edges, boundary_center, cap_boundary)
+from bvh import compute_triangle_bboxes, compute_centroids, build_bvh, flatten_bvh
+from helpers import (compute_face_normals, compute_vertex_normals,
+                     compute_tangents, close_mesh, signed_volume)
 
-MM_PER_UNIT = 660.0          # mesh is ~0.235 units ear to ear; a head is ~155 mm
+# Mesh is ~0.235 units ear to ear; a head is ~155 mm.
+MM_PER_UNIT = 660.0
 
-# ---------------------------------------------------------------- load mesh
+# Epidermis shell depth, in mm. Real facial epidermis is 0.05-0.15 mm.
+EPIDERMIS_THICKNESS = float(os.environ.get("SKIN_T", 0.1))
+
+import os as _os
+RESOLUTION = (int(_os.environ.get("RENDER_W", 600)),
+              int(_os.environ.get("RENDER_H", 600)))
+STACK_MAX = 32          # BVH depth is ~14; 32 is already generous
+
+# ------------------------------------------------------------------ mesh
 positions, uvs, faces = load_obj("Head.obj")
-positions = np.array(positions, dtype=np.float32) * MM_PER_UNIT
+positions = positions * MM_PER_UNIT
 faces = triangulate_faces(faces)
 
-# ------------------------------------------------- close the open bottom
-# the bust is a shell, open where the chest ends. subsurface rays would
-# walk out through that hole and hit nothing, so seal it before anything
-# else is derived from the mesh.
+# Subsurface rays would walk out through any hole and hit nothing, so seal
+# the mesh before deriving anything from it. Each loop gets its own centre.
+positions, uvs, faces = close_mesh(positions, uvs, faces)
 
-def count_loops(boundary):
-    from collections import defaultdict
-    adj = defaultdict(list)
-    for a, b in boundary:
-        adj[a].append(b)
-        adj[b].append(a)
-    seen = set()
-    loops = 0
-    for v in adj:
-        if v in seen:
-            continue
-        loops += 1
-        stack = [v]
-        while stack:
-            x = stack.pop()
-            if x in seen:
-                continue
-            seen.add(x)
-            stack.extend(adj[x])
-    return loops
+volume = signed_volume(positions, faces)
+print(f"signed volume: {volume:+.1f} mm^3")
+if volume < 0:
+    raise RuntimeError(
+        "winding is inside out - every normal points into the skull. "
+        "Reverse each triangle at load time.")
 
-
-boundary = find_boundary_edges(faces)
-print("boundary loops:", count_loops(boundary))   
-
-center, bverts = boundary_center(positions, boundary)
-positions, uvs, faces = cap_boundary(positions, uvs, faces, boundary, center)
-print("boundary edges after capping:", len(find_boundary_edges(faces)))
-
-# everything below depends on the capped mesh, so derive it only now
-uvs_np = np.array(uvs, dtype=np.float32)
 num_faces = len(faces)
 num_verts = positions.shape[0]
-num_uvs = uvs_np.shape[0]
+num_uvs = uvs.shape[0]
 
-# ---------------------------------------------------------------- tangents
-tri_tangent_np = compute_tangents(positions, uvs, faces)
-tri_tangent = ti.Vector.field(3, dtype=ti.f32, shape=num_faces)
-tri_tangent.from_numpy(tri_tangent_np)
-
-print("degenerate tangents:",
-      np.sum(np.all(tri_tangent_np == np.array([1.0, 0.0, 0.0]), axis=1)))
-
-# ---------------------------------------------------------------- normals
+# --------------------------------------------------------------- normals
+face_normals = compute_face_normals(positions, faces)
+vertex_normals = compute_vertex_normals(positions, faces)
 centroids = compute_centroids(positions, faces)
-face_normals = compute_face_normals(faces, positions)
-vertex_normals = compute_vertex_normal(faces, positions, face_normals)
 
-# ------------------------------------------------------------ inner mesh
-EPIDERMIS_THICKNESS = float(os.environ.get("SKIN_T", 0.03))
-inner_positions = positions - vertex_normals * EPIDERMIS_THICKNESS
+tri_tangent_np, tri_handedness_np = compute_tangents(
+    positions, uvs, faces, vertex_normals)
 
-inner_face_normals = compute_face_normals(faces, inner_positions)
-dots = np.sum(inner_face_normals * face_normals, axis=1)
-print("flipped triangles:", np.sum(dots < 0))
+degenerate = np.sum(np.all(tri_tangent_np == np.array([1.0, 0.0, 0.0]), axis=1))
+print(f"degenerate tangents: {degenerate} / {num_faces}")
 
-# ------------------------------------------------------------ outer BVH
-all_indices = np.arange(num_faces)
-root = build_bvh(positions, faces, centroids, all_indices)
+# ---------------------------------------------------------- inner shell
+inner_positions = (positions - vertex_normals * EPIDERMIS_THICKNESS).astype(np.float32)
 
-(node_bbox_min_np, node_bbox_max_np, node_left_np, node_right_np,
- node_tri_start_np, node_tri_count_np, leaf_triangle_indices_np) = flatten_bvh(root)
+inner_face_normals = compute_face_normals(inner_positions, faces)
+flipped = int(np.sum(np.sum(inner_face_normals * face_normals, axis=1) < 0))
+print(f"inverted inner triangles: {flipped} / {num_faces}")
+if flipped:
+    print("  -> the offset exceeds the local concave radius somewhere "
+          "(nostrils, ear canal, tear ducts). Reduce SKIN_T.")
 
-num_nodes = node_bbox_min_np.shape[0]
-num_leaf_refs = leaf_triangle_indices_np.shape[0]
+inner_volume = signed_volume(inner_positions, faces)
+print(f"inner volume: {inner_volume:+.1f} mm^3 "
+      f"({100.0 * inner_volume / volume:.1f}% of outer)")
 
-# per-triangle index tables (shared by both meshes - same topology)
+# ------------------------------------------------- shared index tables
+# Both shells have identical topology, so these are shared.
 tri_vertex_idx_np = np.array(
-    [[face[0][0], face[1][0], face[2][0]] for face in faces], dtype=np.int32
-)
+    [[f[0][0], f[1][0], f[2][0]] for f in faces], dtype=np.int32)
+
+assert all(i is not None for f in faces for (_, i) in f), "missing UV index"
 tri_uv_idx_np = np.array(
-    [[face[0][1], face[1][1], face[2][1]] for face in faces], dtype=np.int32
-)
+    [[f[0][1], f[1][1], f[2][1]] for f in faces], dtype=np.int32)
 
-# in scene.py
-overflow_count = ti.field(dtype=ti.i32, shape=())
 
-# ---------------------------------------------------------- outer fields
-positions_field = ti.Vector.field(3, dtype=ti.f32, shape=num_verts)
-positions_field.from_numpy(positions)
+def build_and_upload(verts, label):
+    """Build a BVH over `verts` with the shared topology and push it to
+    Taichi fields. Returns a dict of fields."""
+    tri_min, tri_max = compute_triangle_bboxes(verts, faces)
+    cents = compute_centroids(verts, faces)
+    root = build_bvh(tri_min, tri_max, cents, np.arange(num_faces))
 
-vertex_normals_field = ti.Vector.field(3, dtype=ti.f32, shape=num_verts)
+    (bmin, bmax, left, right, tri_start, tri_count, leaf_idx) = flatten_bvh(root)
+    n_nodes = bmin.shape[0]
+
+    f = {
+        "positions": ti.Vector.field(3, ti.f32, shape=num_verts),
+        "bbox_min": ti.Vector.field(3, ti.f32, shape=n_nodes),
+        "bbox_max": ti.Vector.field(3, ti.f32, shape=n_nodes),
+        "left": ti.field(ti.i32, shape=n_nodes),
+        "right": ti.field(ti.i32, shape=n_nodes),
+        "tri_start": ti.field(ti.i32, shape=n_nodes),
+        "tri_count": ti.field(ti.i32, shape=n_nodes),
+        "leaf_idx": ti.field(ti.i32, shape=leaf_idx.shape[0]),
+    }
+    f["positions"].from_numpy(verts.astype(np.float32))
+    f["bbox_min"].from_numpy(bmin)
+    f["bbox_max"].from_numpy(bmax)
+    f["left"].from_numpy(left)
+    f["right"].from_numpy(right)
+    f["tri_start"].from_numpy(tri_start)
+    f["tri_count"].from_numpy(tri_count)
+    f["leaf_idx"].from_numpy(leaf_idx)
+
+    print(f"{label} BVH: {n_nodes} nodes, {leaf_idx.shape[0]} leaf refs")
+    return f
+
+
+outer = build_and_upload(positions, "outer")
+inner = build_and_upload(inner_positions, "inner")
+
+# ----------------------------------------------------- shared geometry
+vertex_normals_field = ti.Vector.field(3, ti.f32, shape=num_verts)
 vertex_normals_field.from_numpy(vertex_normals.astype(np.float32))
 
-tri_vertex_idx = ti.Vector.field(3, dtype=ti.i32, shape=num_faces)
+tri_vertex_idx = ti.Vector.field(3, ti.i32, shape=num_faces)
 tri_vertex_idx.from_numpy(tri_vertex_idx_np)
 
-tri_uv_idx = ti.Vector.field(3, dtype=ti.i32, shape=num_faces)
+tri_uv_idx = ti.Vector.field(3, ti.i32, shape=num_faces)
 tri_uv_idx.from_numpy(tri_uv_idx_np)
 
-uvs_field = ti.Vector.field(2, dtype=ti.f32, shape=num_uvs)
-uvs_field.from_numpy(uvs_np)
+uvs_field = ti.Vector.field(2, ti.f32, shape=num_uvs)
+uvs_field.from_numpy(uvs.astype(np.float32))
 
-node_bbox_min = ti.Vector.field(3, dtype=ti.f32, shape=num_nodes)
-node_bbox_max = ti.Vector.field(3, dtype=ti.f32, shape=num_nodes)
-node_bbox_min.from_numpy(node_bbox_min_np)
-node_bbox_max.from_numpy(node_bbox_max_np)
+tri_tangent = ti.Vector.field(3, ti.f32, shape=num_faces)
+tri_tangent.from_numpy(tri_tangent_np)
 
-node_left = ti.field(dtype=ti.i32, shape=num_nodes)
-node_right = ti.field(dtype=ti.i32, shape=num_nodes)
-node_left.from_numpy(node_left_np)
-node_right.from_numpy(node_right_np)
+tri_handedness = ti.field(ti.f32, shape=num_faces)
+tri_handedness.from_numpy(tri_handedness_np)
 
-node_tri_start = ti.field(dtype=ti.i32, shape=num_nodes)
-node_tri_count = ti.field(dtype=ti.i32, shape=num_nodes)
-node_tri_start.from_numpy(node_tri_start_np)
-node_tri_count.from_numpy(node_tri_count_np)
+# ------------------------------------------------- traversal scratch
+# One stack per pixel per mesh: the outer and inner traversals run back to
+# back inside the subsurface walk and must not share scratch space.
+stack_field = ti.field(ti.i32, shape=(RESOLUTION[0], RESOLUTION[1], 2, STACK_MAX))
+overflow_count = ti.field(ti.i32, shape=())
 
-leaf_triangle_indices = ti.field(dtype=ti.i32, shape=num_leaf_refs)
-leaf_triangle_indices.from_numpy(leaf_triangle_indices_np)
-
-# ------------------------------------------------------------ inner BVH
-inner_centroids = compute_centroids(inner_positions, faces)
-inner_root = build_bvh(inner_positions, faces, inner_centroids, all_indices)
-
-(inner_node_bbox_min_np, inner_node_bbox_max_np, inner_node_left_np,
- inner_node_right_np, inner_node_tri_start_np, inner_node_tri_count_np,
- inner_leaf_triangle_indices_np) = flatten_bvh(inner_root)
-
-inner_num_nodes = inner_node_bbox_min_np.shape[0]
-inner_num_leaf_refs = inner_leaf_triangle_indices_np.shape[0]
-
-inner_positions_field = ti.Vector.field(3, dtype=ti.f32, shape=num_verts)
-inner_positions_field.from_numpy(inner_positions.astype(np.float32))
-
-inner_node_bbox_min = ti.Vector.field(3, dtype=ti.f32, shape=inner_num_nodes)
-inner_node_bbox_max = ti.Vector.field(3, dtype=ti.f32, shape=inner_num_nodes)
-inner_node_bbox_min.from_numpy(inner_node_bbox_min_np)
-inner_node_bbox_max.from_numpy(inner_node_bbox_max_np)
-
-inner_node_left = ti.field(dtype=ti.i32, shape=inner_num_nodes)
-inner_node_right = ti.field(dtype=ti.i32, shape=inner_num_nodes)
-inner_node_left.from_numpy(inner_node_left_np)
-inner_node_right.from_numpy(inner_node_right_np)
-
-inner_node_tri_start = ti.field(dtype=ti.i32, shape=inner_num_nodes)
-inner_node_tri_count = ti.field(dtype=ti.i32, shape=inner_num_nodes)
-inner_node_tri_start.from_numpy(inner_node_tri_start_np)
-inner_node_tri_count.from_numpy(inner_node_tri_count_np)
-
-inner_leaf_triangle_indices = ti.field(dtype=ti.i32, shape=inner_num_leaf_refs)
-inner_leaf_triangle_indices.from_numpy(inner_leaf_triangle_indices_np)
-
-print("outer BVH nodes:", num_nodes, " inner BVH nodes:", inner_num_nodes)
-
-# ------------------------------------------------------ traversal scratch
-# one stack per pixel PER MESH. the outer and inner traversals run back to
-# back inside the subsurface walk, so they must not share scratch space.
-STACK_MAX = 64
-stack_field = ti.field(dtype=ti.i32, shape=(600, 600, 2, STACK_MAX))
+lo, hi = positions.min(axis=0), positions.max(axis=0)
+print(f"bounds (mm): {lo} .. {hi}")
+print(f"extent (mm): {hi - lo}")
 
 
-print("mesh min:", positions.min(axis=0))
-print("mesh max:", positions.max(axis=0))
+# ------------------------------------------------------- back compatibility
+# Flat names for the outer/inner field dicts, matching the original scene.py.
+positions_field = outer["positions"]
+node_bbox_min = outer["bbox_min"]
+node_bbox_max = outer["bbox_max"]
+node_left = outer["left"]
+node_right = outer["right"]
+node_tri_start = outer["tri_start"]
+node_tri_count = outer["tri_count"]
+leaf_triangle_indices = outer["leaf_idx"]
+
+inner_positions_field = inner["positions"]
+inner_node_bbox_min = inner["bbox_min"]
+inner_node_bbox_max = inner["bbox_max"]
+inner_node_left = inner["left"]
+inner_node_right = inner["right"]
+inner_node_tri_start = inner["tri_start"]
+inner_node_tri_count = inner["tri_count"]
+inner_leaf_triangle_indices = inner["leaf_idx"]
 
 
-i = np.argmin(positions[:, 0])
-print("ear tip vertex:", positions[i])
 
-# and the spread of everything near that x, to get the ear's extent
-head = positions[positions[:, 1] > 170]
-i = np.argmin(head[:, 0])
-print("head widest point:", head[i])
 
-near = head[head[:, 0] < head[:, 0].min() + 8]
-print("ear y range:", near[:, 1].min(), near[:, 1].max())
-print("ear z range:", near[:, 2].min(), near[:, 2].max())
+# ear region verts
+ear = positions[(positions[:,0] < -45) & (positions[:,1] > 175) & (positions[:,1] < 210)]
+c = ear.mean(axis=0)
+print("ear center:", c)
 
-# print("boundary edges:", len(boundary))
-# def boundary_center(positions, boundary):
-#     verts = set()
-#     for a, b in boundary:
-#         verts.add(a)
-#         verts.add(b)
-#     verts = list(verts)
-#     return np.mean(positions[verts], axis=0), verts
+# the ear's outward direction ≈ average vertex normal there
+en = vertex_normals[(positions[:,0] < -45) & (positions[:,1] > 175) & (positions[:,1] < 210)]
+d = en.mean(axis=0)
+d = d / np.linalg.norm(d)
+print("ear faces:", d)
 
-# center, bverts = boundary_center(positions, boundary)
-# print("boundary verts:", len(bverts))
-# print("center:", center)
-
-# positions, uvs, faces = cap_boundary(positions, uvs, faces, boundary, center)
-# print("faces after capping:", len(faces))
-
-# boundary_after = find_boundary_edges(faces)
-# print("boundary edges after capping:", len(boundary_after))
+# camera 250mm out along that direction, light 60mm behind the ear
+print("camera pos:", c + d*250)
+print("light pos: ", c - d*60)

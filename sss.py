@@ -1,10 +1,10 @@
 import numpy as np
 import taichi as ti
 import taichi.math as tm
+
 from sampling import build_coordinate_system
 from trace import trace_inner, trace_outer
 from shading import interpolate_normal
-import os
 
 # --- Table 2 (paper), mm^-1, at R=700nm G=546.1nm B=435.8nm ---
 SIGMA_A_EUMELANIN   = np.array([22.150,   50.632,  107.330], dtype=np.float32)
@@ -37,9 +37,13 @@ walk_rgb = ti.field(dtype=ti.f64, shape=3)
 # internal reflection instead of escaping
 walk_tir = ti.field(dtype=ti.i32, shape=())
 
+# diagnostics: [0] scattering events, [1] wall crossings, [2] steps spent in
+# the epidermis, [3] total steps. f64 because these run to ~1e11.
+walk_diag = ti.field(dtype=ti.f64, shape=4)
+
 # ceiling on throughput after a pdf division. slight bias, but an unlucky
 # sample can otherwise return an enormous value and produce a firefly pixel
-MAX_THROUGHPUT = 100.0
+MAX_THROUGHPUT = 4.0
 
 # roulette only starts after this many steps, so short walks run untouched
 ROULETTE_START = 512
@@ -65,15 +69,6 @@ def to_sigma_s(mu_s_prime, g=G):
 
 
 # --- biological parameters (Table 3 ranges) ---
-# MELANIN_FRACTION = float(os.environ.get("SKIN_V", 0.02))
-# MELANIN_BLEND    = float(os.environ.get("SKIN_ALPHA", 0.5))
-# HEMOGLOBIN_FRAC  = float(os.environ.get("SKIN_TAU", 0.025))
-
-
-# MELANIN_FRACTION = 0.30     # v    (was 0.02; paper range 0.013-0.43)
-# MELANIN_BLEND    = 0.8      # alpha (higher = more eumelanin, the brown-black one)
-# HEMOGLOBIN_FRAC  = 0.025    # tau  (leave as is)
-
 MELANIN_FRACTION = 0.005
 MELANIN_BLEND    = 0.5
 HEMOGLOBIN_FRAC  = 0.02
@@ -130,9 +125,9 @@ def sample_hg(wi, g):
     return tm.normalize(wo), hg_phase(cos_theta, g)
 
 
-#refract
+# refract
 IOR_SKIN = 1.4
-#reflect (heads on)
+# reflect (head on)
 F0_SKIN = ((IOR_SKIN - 1.0) / (IOR_SKIN + 1.0)) ** 2   # ~0.028
 
 
@@ -182,9 +177,11 @@ def random_walk_sss(start_pos, start_dir, px, py):
     start_pos must already be just below the outer surface.
 
     The layer is derived from geometry every step rather than tracked with a
-    flag: if the next inner-mesh hit is a FRONT face (normal opposing the
-    direction of travel) we are outside the inner mesh, i.e. the epidermis.
-    A back face means we are inside it, i.e. the dermis. This cannot drift.
+    flag: the trace's `front` value is -1 when the inner mesh is struck from
+    within, which means we are in the dermis, and +1 when struck from outside,
+    which means we are in the epidermis. This comes from the geometric normal,
+    so unlike a dot product against the interpolated normal it cannot flip the
+    wrong way near a silhouette. It also cannot drift.
 
     Free-flight distances are sampled from ONE colour channel, chosen in
     proportion to how much throughput is left in each. The weights are
@@ -209,20 +206,29 @@ def random_walk_sss(start_pos, start_dir, px, py):
     lost = 0
     rouletted = 0
 
+    n_scat = 0.0
+    n_wall = 0.0
+    n_epi = 0.0
+    n_step = 0.0
+
     for step in range(MAX_WALK_STEPS):
-        t_out, tri_out, u_out, v_out = trace_outer(pos, dir, px, py)
-        t_in, tri_in, u_in, v_in = trace_inner(pos, dir, px, py)
+        n_step += 1.0
+        t_out, tri_out, u_out, v_out, front_out = trace_outer(pos, dir, px, py)
+        t_in, tri_in, u_in, v_in, front_in = trace_inner(pos, dir, px, py)
 
         if t_out > 1e29 and t_in > 1e29:
             lost = 1
             break
 
         # --- which layer are we in? decided by geometry, not history ---
+        # front_in < 0 means the inner shell is hit from the inside, so the
+        # walk is currently within it: the dermis.
         in_epidermis = 1
-        if tri_in >= 0:
-            n_in = interpolate_normal(tri_in, u_in, v_in)
-            if tm.dot(dir, n_in) > 0.0:
-                in_epidermis = 0        # leaving the inner mesh -> inside it
+        if tri_in >= 0 and front_in < 0.0:
+            in_epidermis = 0
+
+        if in_epidermis == 1:
+            n_epi += 1.0
 
         sigma_t = SIGMA_T_EPI
         sigma_s = SIGMA_S_EPI
@@ -251,7 +257,7 @@ def random_walk_sss(start_pos, start_dir, px, py):
             c = ti.min(int(ti.random(ti.f32) * 3.0), 2)
             w = tm.vec3(1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0)
 
-        d = -tm.log(1.0 - ti.random(ti.f32)) / sigma_t[c] #free distance
+        d = -tm.log(1.0 - ti.random(ti.f32)) / sigma_t[c]   # free distance
 
         # --- nearest boundary ahead ---
         t_wall = t_out
@@ -272,6 +278,7 @@ def random_walk_sss(start_pos, start_dir, px, py):
 
             pos = pos + d * dir
             dir, phase = sample_hg(dir, G)
+            n_scat += 1.0
 
         else:
             # reached a boundary first; no scattering event, so no sigma_s
@@ -279,17 +286,20 @@ def random_walk_sss(start_pos, start_dir, px, py):
             pdf = w[0] * trans[0] + w[1] * trans[1] + w[2] * trans[2]
             throughput *= trans / tm.max(pdf, 1e-8)
             throughput = tm.min(throughput, MAX_THROUGHPUT)
+            n_wall += 1.0
 
             pos = pos + t_wall * dir
 
             if hit_outer == 1:
                 # --- outer surface: escape, or reflect back inside? ---
-                n_exit = interpolate_normal(tri_out, u_out, v_out)
-                if tm.dot(n_exit, dir) < 0.0:
-                    n_exit = -n_exit              # point it outward
+                # front_out is -1 here (struck from within), and passing it to
+                # interpolate_normal already flips the normal to face the ray.
+                # Negate to get the outward-pointing normal.
+                n_exit = -interpolate_normal(tri_out, u_out, v_out, front_out)
 
                 cos_i = tm.clamp(tm.dot(dir, n_exit), 0.0, 1.0)
-                F_exit = fresnel_dielectric_exit(cos_i, IOR_SKIN) #prob light does not go out
+                # probability the light does NOT get out
+                F_exit = fresnel_dielectric_exit(cos_i, IOR_SKIN)
 
                 if ti.random(ti.f32) < F_exit:
                     # trapped. mirror the direction about the surface and
@@ -312,14 +322,13 @@ def random_walk_sss(start_pos, start_dir, px, py):
                     break
 
             else:
-                # cross the inner boundary. push along the wall normal so we
-                # clear it whatever angle we arrived at, and carry on the way
-                # we were already heading.
-                n_cross = interpolate_normal(tri_in, u_in, v_in)
-                if tm.dot(dir, n_cross) < 0.0:
-                    pos = pos - n_cross * SURF_EPS
-                else:
-                    pos = pos + n_cross * SURF_EPS
+                # cross the inner boundary. front_in tells us which side we
+                # arrived from, so push along the direction of travel to clear
+                # it, and carry on the way we were already heading.
+                n_cross = interpolate_normal(tri_in, u_in, v_in, front_in)
+                # n_cross now opposes dir, so stepping against it clears the
+                # surface no matter which side we came from
+                pos = pos - n_cross * SURF_EPS
                 # no flag to flip: the layer is re-derived next step
 
         # --- russian roulette: kill dim walks, scale up survivors ---
@@ -334,6 +343,11 @@ def random_walk_sss(start_pos, start_dir, px, py):
                     break
                 throughput /= survive
 
+    ti.atomic_add(walk_diag[0], ti.cast(n_scat, ti.f64))
+    ti.atomic_add(walk_diag[1], ti.cast(n_wall, ti.f64))
+    ti.atomic_add(walk_diag[2], ti.cast(n_epi, ti.f64))
+    ti.atomic_add(walk_diag[3], ti.cast(n_step, ti.f64))
+
     if escaped == 1:
         ti.atomic_add(walk_stats[0], 1)
     elif lost == 1:
@@ -344,5 +358,3 @@ def random_walk_sss(start_pos, start_dir, px, py):
         ti.atomic_add(walk_stats[3], 1)     # hard cap - real loss
 
     return pos, dir, throughput, escaped, exit_tri, exit_u, exit_v
-
-

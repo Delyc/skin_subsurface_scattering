@@ -10,7 +10,8 @@ from sampling import cosine_weighted_hemisphere_sample, sample_ggx
 from lighting import (direct_light_specular, direct_light_diffuse,
                       intersect_light, light_pdf_toward, power_heuristic,
                       light_emission)
-from brdf import fresnel_schlick, eval_specular_brdf, brdf_pdf
+from brdf import (fresnel_schlick, eval_specular_brdf, brdf_pdf,
+                  subsurface_weight)
 from sss import random_walk_sss, refract_into_medium, F0_SKIN, IOR_SKIN
 
 MAX_BOUNCE = 8
@@ -20,7 +21,7 @@ MAX_BOUNCE = 8
 # feature you would see.
 SURF_EPS = 1e-2
 
-# ROUGHNESS = sample_roughness(uv)
+ROUGHNESS = 0.15
 
 
 @ti.func
@@ -65,7 +66,7 @@ def radiance(ray_origin, ray_dir, px, py):
         shading_normal = apply_normal_map(
             uv, normal, tri_tangent[tri_idx], tri_handedness[tri_idx] * front)
 
-        roughness = sample_roughness(uv)
+        roughness = ROUGHNESS
         wo = -direction
 
         # Fresnel picks the lobe: reflect off the oil film, or enter the skin.
@@ -126,9 +127,11 @@ def radiance(ray_origin, ray_dir, px, py):
             if pdf <= 1e-8:
                 break
 
-            # Lambertian (1/pi) * cos / (cos/pi) == 1, so throughput is
-            # unchanged. No exit Fresnel here: random_walk_sss already spent
-            # it on the escape roulette.
+            # Lambertian (1/pi) * cos / (cos/pi) == 1, so only the exit
+            # Fresnel remains. Direct lighting already applies its own; this
+            # is the matching factor for the indirect continuation, and
+            # without it indirect bounces read too bright at grazing angles.
+            throughput *= subsurface_weight(exit_normal, new_dir, exit_uv)
 
             prev_pdf = pdf
             origin = exit_pos + exit_normal * SURF_EPS

@@ -1,44 +1,25 @@
-import numpy as np 
+import numpy as np
 
 def load_obj(path):
-    positions = []
-    uvs = []
-    faces = []
-
-    with open(path, 'r') as f:
+    positions, uvs, faces = [], [], []
+    with open(path) as f:
         for line in f:
-            if line.startswith('v '):
-                parts = line.split()
-                positions.append([parts[1], parts[2], parts[3]]) #xyz
-            elif line.startswith('vt '):
-                parts = line.split()
-                uvs.append([parts[1], parts[2]])
-            elif line.startswith('f '):
-                parts = line.split()[1:]
+            parts = line.split()
+            if not parts:
+                continue
+            if parts[0] == 'v':
+                positions.append([float(x) for x in parts[1:4]])
+            elif parts[0] == 'vt':
+                uvs.append([float(x) for x in parts[1:3]])
+            elif parts[0] == 'f':
                 face = []
-                for part in parts:
-                    idxs = part.split('/')
-                    v_idx = int(idxs[0]) - 1
-                    uv_idx = int(idxs[1]) - 1 if len(idxs) > 1 and idxs[1] else - 1
-                    face.append((v_idx, uv_idx))
-                
+                for p in parts[1:]:
+                    i = p.split('/')
+                    v = int(i[0]) - 1
+                    vt = int(i[1]) - 1 if len(i) > 1 and i[1] else None
+                    face.append((v, vt))
                 faces.append(face)
-        
-    return positions, uvs, faces
-
+    return np.array(positions, np.float32), np.array(uvs, np.float32), faces
 
 def triangulate_faces(faces):
-    tri_faces = []
-    for face in faces:
-        tri_faces.append((face[0], face[1], face[2]))
-        tri_faces.append((face[0], face[2], face[3]))
-    return tri_faces
-
-
-
-
-                    
-
-
-
-
+    return [(f[0], f[i], f[i+1]) for f in faces for i in range(1, len(f)-1)]

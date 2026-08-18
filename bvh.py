@@ -1,73 +1,41 @@
-import numpy as np 
-from load_obj import load_obj
-from load_obj import triangulate_faces
+import numpy as np
 
-#each triangles min and max
+from load_obj import load_obj, triangulate_faces
+
+
+LEAF_SIZE = 4
+BBOX_PAD = 1e-6  # flat slabs -> 0 * inf -> NaN in slab tests
+
+
 def compute_triangle_bboxes(positions, faces):
-    bboxes = []
-    for face in faces:
-        v_idx0 = face[0][0]
-        v_idx1 = face[1][0]
-        v_idx2 = face[2][0]
-
-        p0 = positions[v_idx0]
-        p1 = positions[v_idx1]
-        p2 = positions[v_idx2]
-
-        min_corner = np.min(np.array([p0, p1, p2]), axis = 0)
-        max_corner = np.max(np.array([p0, p1, p2]), axis = 0)
-
-        bboxes.append((min_corner, max_corner))
-    
-    return bboxes
-
-
-def compute_root_bbox(bboxes):
-    all_mins = np.array([b[0] for b in bboxes])
-    all_maxs = np.array([b[1] for b in bboxes])
-
-    root_min = np.min(all_mins, axis = 0)
-    root_max = np.max(all_maxs, axis = 0)
-
-    return root_min, root_max
-
-
-def centroid(p0, p1, p2):
-    return (p0 + p1 + p2) / 3
+    """Per-triangle min/max corners. Returns two (N, 3) arrays."""
+    assert all(len(f) == 3 for f in faces), "there is a quad"
+    idx = np.array([[f[0][0], f[1][0], f[2][0]] for f in faces])
+    tris = positions[idx]  # (N, 3, 3)
+    return tris.min(axis=1), tris.max(axis=1)
 
 
 def compute_centroids(positions, faces):
-    centroids = []
-    for face in faces:
-        v_idx0 = face[0][0]
-        v_idx1 = face[1][0]
-        v_idx2 = face[2][0]
-
-        p0 = positions[v_idx0]
-        p1 = positions[v_idx1]
-        p2 = positions[v_idx2]
-
-        centroids.append(centroid(p0, p1, p2))
-
-    return np.array(centroids)
+    """Per-triangle centroid. Returns an (N, 3) array."""
+    assert all(len(f) == 3 for f in faces), "there is a quad"
+    idx = np.array([[f[0][0], f[1][0], f[2][0]] for f in faces])
+    return positions[idx].mean(axis=1)
 
 
 def longest_axis(min_corner, max_corner):
-    extent = max_corner - min_corner
-    return np.argmax(extent)
+    return int(np.argmax(max_corner - min_corner))
+
 
 def split_triangles(centroids, axis):
-    values = centroids[:, axis]
-    median = np.median(values)
-
-    left_indices = np.where(values <= median)[0]
-    right_indices = np.where(values > median)[0]
-
-    return left_indices, right_indices
+    """Median split by sorted rank, so both sides are always non-empty."""
+    order = np.argsort(centroids[:, axis], kind="stable")
+    mid = len(order) // 2
+    return order[:mid], order[mid:]
 
 
 class BVHNode:
-    def __init__(self, bbox_min, bbox_max, left = None, right = None, triangle_indices = None):
+    def __init__(self, bbox_min, bbox_max, left=None, right=None,
+                 triangle_indices=None):
         self.bbox_min = bbox_min
         self.bbox_max = bbox_max
         self.left = left
@@ -75,32 +43,28 @@ class BVHNode:
         self.triangle_indices = triangle_indices
 
 
-LEAF_SIZE = 4
-
-def build_bvh(positions, faces, centroids, triangle_indices):
-    sub_faces = [faces[i] for i in triangle_indices]
-    bboxes = compute_triangle_bboxes(positions, sub_faces)
-    bbox_min, bbox_max = compute_root_bbox(bboxes)
+def build_bvh(tri_min, tri_max, centroids, triangle_indices):
+    bbox_min = tri_min[triangle_indices].min(axis=0) - BBOX_PAD
+    bbox_max = tri_max[triangle_indices].max(axis=0) + BBOX_PAD
 
     if len(triangle_indices) <= LEAF_SIZE:
-        return BVHNode(bbox_min, bbox_max, triangle_indices = triangle_indices)
-    
-    sub_centroids = centroids[triangle_indices]
+        return BVHNode(bbox_min, bbox_max, triangle_indices=triangle_indices)
+
     axis = longest_axis(bbox_min, bbox_max)
-    left_local, right_local = split_triangles(sub_centroids, axis)
+    left_local, right_local = split_triangles(centroids[triangle_indices], axis)
 
-    left_indices = triangle_indices[left_local]
-    right_indices = triangle_indices[right_local]
-
-    left_node = build_bvh(positions, faces, centroids, left_indices)
-    right_node = build_bvh(positions, faces, centroids, right_indices)
-
-    return BVHNode(bbox_min, bbox_max, left = left_node, right = right_node)
-
-
+    return BVHNode(
+        bbox_min,
+        bbox_max,
+        left=build_bvh(tri_min, tri_max, centroids,
+                       triangle_indices[left_local]),
+        right=build_bvh(tri_min, tri_max, centroids,
+                        triangle_indices[right_local]),
+    )
 
 
 def flatten_bvh(root):
+    """Depth-first flatten into flat arrays ready for Taichi fields."""
     node_bbox_min = []
     node_bbox_max = []
     node_left = []
@@ -108,7 +72,6 @@ def flatten_bvh(root):
     node_tri_start = []
     node_tri_count = []
     leaf_triangle_indices = []
-
 
     def visit(node):
         my_id = len(node_bbox_min)
@@ -120,21 +83,18 @@ def flatten_bvh(root):
         node_tri_count.append(0)
 
         if node.triangle_indices is not None:
-            start = len(leaf_triangle_indices)
-            leaf_triangle_indices.extend(node.triangle_indices.tolist())
-            node_tri_start[my_id] = start
+            node_tri_start[my_id] = len(leaf_triangle_indices)
             node_tri_count[my_id] = len(node.triangle_indices)
-        
+            leaf_triangle_indices.extend(node.triangle_indices.tolist())
         else:
-            left_id = visit(node.left)
-            right_id = visit(node.right)
-            node_left[my_id] = left_id
-            node_right[my_id] = right_id
+            node_left[my_id] = visit(node.left)
+            node_right[my_id] = visit(node.right)
 
         return my_id
+
     visit(root)
 
-    return(
+    return (
         np.array(node_bbox_min, dtype=np.float32),
         np.array(node_bbox_max, dtype=np.float32),
         np.array(node_left, dtype=np.int32),
@@ -143,3 +103,27 @@ def flatten_bvh(root):
         np.array(node_tri_count, dtype=np.int32),
         np.array(leaf_triangle_indices, dtype=np.int32),
     )
+
+
+def build_from_obj(path):
+    """Load an OBJ and return (positions, uvs, tris, flattened BVH)."""
+    positions, uvs, faces = load_obj(path)
+    tris = triangulate_faces(faces)
+
+    tri_min, tri_max = compute_triangle_bboxes(positions, tris)
+    centroids = compute_centroids(positions, tris)
+
+    root = build_bvh(tri_min, tri_max, centroids, np.arange(len(tris)))
+    return positions, uvs, tris, flatten_bvh(root)
+
+
+if __name__ == "__main__":
+    positions, uvs, tris, flat = build_from_obj("head.obj")
+    node_min, node_max, left, right, tri_start, tri_count, leaf_idx = flat
+
+    print(f"verts     {positions.shape}")
+    print(f"uvs       {uvs.shape}")
+    print(f"tris      {len(tris)}")
+    print(f"nodes     {len(node_min)}  (leaves {(tri_count > 0).sum()})")
+    print(f"leaf idx  {len(leaf_idx)}  (must equal tris)")
+    print(f"bbox      {node_min[0]}  {node_max[0]}")

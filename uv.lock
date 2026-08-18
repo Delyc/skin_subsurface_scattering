@@ -692,7 +692,7 @@ requires-dist = [
     { name = "imageio", specifier = ">=2.37.4" },
     { name = "matplotlib", specifier = ">=3.11.1" },
     { name = "numpy", specifier = ">=2.4.6" },
-    { name = "taichi", specifier = ">=1.7.4" },
+    { name = "taichi", specifier = "==1.7.4" },
 ]
 
 [[package]]
