@@ -3,7 +3,7 @@ import taichi.math as tm
 
 from helpers import environment_light
 from shading import interpolate_normal, interpolate_uv
-from texture import apply_normal_map, sample_roughness
+from texture import apply_normal_map, sample_roughness, sample_albedo
 from scene import tri_tangent, tri_handedness
 from trace import trace_outer
 from sampling import cosine_weighted_hemisphere_sample, sample_ggx
@@ -18,7 +18,7 @@ if HAS_EYES:
     from trace import trace_eyeball
     from scene import (eye_vertex_normals_field, eye_tri_vertex_idx,
                        eye_tri_uv_idx, eye_uvs_field)
-    from eye import eval_eye_brdf
+    from eye import eval_eye_brdf, sample_eye_diffuse
     from lighting import sample_light, shadow_ray_blocked
 
 MAX_BOUNCE = 8
@@ -210,4 +210,32 @@ def radiance(ray_origin, ray_dir, px, py):
     return L
 
 
+@ti.func
+def primary_aov(ray_origin, ray_dir, px, py):
+    """First-hit albedo and normal for the denoiser's guide buffers.
 
+    Noise-free by construction: one trace, no lighting, no walk. OIDN uses
+    them to tell a real edge from Monte Carlo noise, keeping pores and the
+    iris sharp instead of smeared. Both zero on a miss (background)."""
+    albedo = tm.vec3(0.0, 0.0, 0.0)
+    nrm = tm.vec3(0.0, 0.0, 0.0)
+
+    t, tri_idx, u, v, front = trace_outer(ray_origin, ray_dir, px, py)
+    got = 0
+
+    if ti.static(HAS_EYES):
+        et, e_tri, eu, ev, e_front = trace_eyeball(ray_origin, ray_dir, px, py)
+        head_t = t if tri_idx >= 0 else 1e30
+        if e_tri >= 0 and et < head_t:
+            albedo = sample_eye_diffuse(eye_uv_at(e_tri, eu, ev))
+            nrm = eye_normal_at(e_tri, eu, ev, e_front)
+            got = 1
+
+    if got == 0 and tri_idx >= 0:
+        uv = interpolate_uv(tri_idx, u, v)
+        albedo = sample_albedo(uv)
+        n = interpolate_normal(tri_idx, u, v, front)
+        nrm = apply_normal_map(
+            uv, n, tri_tangent[tri_idx], tri_handedness[tri_idx] * front)
+
+    return albedo, nrm
