@@ -12,6 +12,14 @@ from lighting import (direct_light_specular, direct_light_diffuse,
                       light_emission)
 from brdf import fresnel_schlick, eval_specular_brdf, brdf_pdf
 from sss import random_walk_sss, refract_into_medium, F0_SKIN, IOR_SKIN
+from scene import HAS_EYES
+
+if HAS_EYES:
+    from trace import trace_eyeball
+    from scene import (eye_vertex_normals_field, eye_tri_vertex_idx,
+                       eye_tri_uv_idx, eye_uvs_field)
+    from eye import eval_eye_brdf
+    from lighting import sample_light, shadow_ray_blocked
 
 MAX_BOUNCE = 8
 
@@ -21,6 +29,41 @@ MAX_BOUNCE = 8
 SURF_EPS = 1e-2
 
 # ROUGHNESS = sample_roughness(uv)
+
+
+if HAS_EYES:
+    @ti.func
+    def eye_normal_at(tri_idx, u, v, front):
+        vi = eye_tri_vertex_idx[tri_idx]
+        n = ((1.0 - u - v) * eye_vertex_normals_field[vi[0]]
+             + u * eye_vertex_normals_field[vi[1]]
+             + v * eye_vertex_normals_field[vi[2]])
+        return tm.normalize(n) * front
+
+    @ti.func
+    def eye_uv_at(tri_idx, u, v):
+        ti_ = eye_tri_uv_idx[tri_idx]
+        return ((1.0 - u - v) * eye_uvs_field[ti_[0]]
+                + u * eye_uvs_field[ti_[1]]
+                + v * eye_uvs_field[ti_[2]])
+
+    @ti.func
+    def shade_eyeball(hit_point, tri_idx, u, v, front, wo, px, py):
+        """Direct lighting on the eyeball: opaque, diffuse + specular, no walk.
+        One NEE sample against the area light with a shadow test."""
+        n = eye_normal_at(tri_idx, u, v, front)
+        uv = eye_uv_at(tri_idx, u, v)
+
+        Ld = tm.vec3(0.0, 0.0, 0.0)
+        wi, dist, emission, pdf = sample_light(hit_point)
+        if pdf > 0.0:
+            cos_s = tm.dot(wi, n)
+            if cos_s > 0.0:
+                shadow_o = hit_point + n * SURF_EPS
+                if not shadow_ray_blocked(shadow_o, wi, dist, px, py):
+                    brdf = eval_eye_brdf(n, wi, wo, uv)
+                    Ld = emission * brdf * cos_s / pdf
+        return Ld
 
 
 @ti.func
@@ -39,6 +82,26 @@ def radiance(ray_origin, ray_dir, px, py):
 
     for bounce in range(MAX_BOUNCE):
         t, tri_idx, u, v, front = trace_outer(origin, direction, px, py)
+
+        # ---- eyeball: opaque, so if it is nearer than the skin the ray
+        # stops there. Shade it directly and end the path. ----
+        if ti.static(HAS_EYES):
+            et, e_tri, eu, ev, e_front = trace_eyeball(origin, direction, px, py)
+            head_t = t if tri_idx >= 0 else 1e30
+            if e_tri >= 0 and et < head_t:
+                e_hit = origin + et * direction
+                # still let a BSDF-sampled ray that grazes the light count
+                tl, hitl = intersect_light(origin, direction, et)
+                if hitl == 1:
+                    w = 1.0
+                    if prev_pdf > 0.0:
+                        pdf_l = light_pdf_toward(origin, direction, tl)
+                        w = power_heuristic(prev_pdf, pdf_l)
+                    L += throughput * light_emission[None] * w
+                else:
+                    L += throughput * shade_eyeball(
+                        e_hit, e_tri, eu, ev, e_front, -direction, px, py)
+                break
 
         # ---- did this ray hit the light on its way? (BSDF side of MIS) ----
         surface_t = t if tri_idx >= 0 else 1e30
@@ -145,3 +208,6 @@ def radiance(ray_origin, ray_dir, px, py):
             prev_pdf *= survive if prev_pdf > 0.0 else 1.0
 
     return L
+
+
+

@@ -79,18 +79,23 @@ tri_uv_idx_np = np.array(
     [[f[0][1], f[1][1], f[2][1]] for f in faces], dtype=np.int32)
 
 
-def build_and_upload(verts, label):
-    """Build a BVH over `verts` with the shared topology and push it to
-    Taichi fields. Returns a dict of fields."""
-    tri_min, tri_max = compute_triangle_bboxes(verts, faces)
-    cents = compute_centroids(verts, faces)
-    root = build_bvh(tri_min, tri_max, cents, np.arange(num_faces))
+def build_and_upload(verts, label, mesh_faces=None):
+    """Build a BVH over `verts` and push it to Taichi fields. Defaults to the
+    head's face list; pass mesh_faces for a different mesh (the eyeballs)."""
+    if mesh_faces is None:
+        mesh_faces = faces
+    n_verts = verts.shape[0]
+    n_tris = len(mesh_faces)
+
+    tri_min, tri_max = compute_triangle_bboxes(verts, mesh_faces)
+    cents = compute_centroids(verts, mesh_faces)
+    root = build_bvh(tri_min, tri_max, cents, np.arange(n_tris))
 
     (bmin, bmax, left, right, tri_start, tri_count, leaf_idx) = flatten_bvh(root)
     n_nodes = bmin.shape[0]
 
     f = {
-        "positions": ti.Vector.field(3, ti.f32, shape=num_verts),
+        "positions": ti.Vector.field(3, ti.f32, shape=n_verts),
         "bbox_min": ti.Vector.field(3, ti.f32, shape=n_nodes),
         "bbox_max": ti.Vector.field(3, ti.f32, shape=n_nodes),
         "left": ti.field(ti.i32, shape=n_nodes),
@@ -135,14 +140,84 @@ tri_handedness = ti.field(ti.f32, shape=num_faces)
 tri_handedness.from_numpy(tri_handedness_np)
 
 # ------------------------------------------------- traversal scratch
-# One stack per pixel per mesh: the outer and inner traversals run back to
-# back inside the subsurface walk and must not share scratch space.
-stack_field = ti.field(ti.i32, shape=(RESOLUTION[0], RESOLUTION[1], 2, STACK_MAX))
+# One stack per pixel per mesh. Slot 0 outer, 1 inner, 2 eyeball. The head's
+# outer/inner run back to back inside the walk, and the eyeball trace runs
+# alongside the primary head trace, so all three need separate scratch.
+NUM_MESHES = 3
+stack_field = ti.field(ti.i32,
+                       shape=(RESOLUTION[0], RESOLUTION[1], NUM_MESHES, STACK_MAX))
 overflow_count = ti.field(ti.i32, shape=())
 
 lo, hi = positions.min(axis=0), positions.max(axis=0)
 print(f"bounds (mm): {lo} .. {hi}")
 print(f"extent (mm): {hi - lo}")
+
+
+# ============================================================ eyeballs
+# Both eyeballs share one texture set and one material, so they merge into a
+# single mesh with one BVH. They are opaque - no inner shell, no walk.
+def _load_eyeball(path):
+    p, uv, f = load_obj(path)
+    p = p * MM_PER_UNIT
+    f = triangulate_faces(f)
+    return p, uv, f
+
+
+def _merge(meshes):
+    """Concatenate several (positions, uvs, faces) into one mesh, offsetting
+    the vertex and UV indices so each sub-mesh keeps pointing at its own data."""
+    all_p, all_uv, all_f = [], [], []
+    v_off, uv_off = 0, 0
+    for p, uv, f in meshes:
+        all_p.append(p)
+        all_uv.append(uv)
+        for tri in f:
+            all_f.append(tuple((v + v_off, (t + uv_off) if t is not None else None)
+                               for (v, t) in tri))
+        v_off += len(p)
+        uv_off += len(uv)
+    return (np.concatenate(all_p), np.concatenate(all_uv), all_f)
+
+
+try:
+    eye_positions, eye_uvs, eye_faces = _merge([
+        _load_eyeball("OBJ/eyeball_L.obj"),
+        _load_eyeball("OBJ/eyeball_R.obj"),
+    ])
+
+    eye_num_faces = len(eye_faces)
+    eye_num_verts = eye_positions.shape[0]
+    eye_num_uvs = eye_uvs.shape[0]
+
+    eye_vertex_normals = compute_vertex_normals(eye_positions, eye_faces)
+
+    eye_tri_vertex_idx_np = np.array(
+        [[f[0][0], f[1][0], f[2][0]] for f in eye_faces], dtype=np.int32)
+    eye_tri_uv_idx_np = np.array(
+        [[(f[0][1] if f[0][1] is not None else 0),
+          (f[1][1] if f[1][1] is not None else 0),
+          (f[2][1] if f[2][1] is not None else 0)] for f in eye_faces],
+        dtype=np.int32)
+
+    eyeball = build_and_upload(eye_positions, "eyeball", mesh_faces=eye_faces)
+
+    eye_vertex_normals_field = ti.Vector.field(3, ti.f32, shape=eye_num_verts)
+    eye_vertex_normals_field.from_numpy(eye_vertex_normals.astype(np.float32))
+
+    eye_tri_vertex_idx = ti.Vector.field(3, ti.i32, shape=eye_num_faces)
+    eye_tri_vertex_idx.from_numpy(eye_tri_vertex_idx_np)
+    eye_tri_uv_idx = ti.Vector.field(3, ti.i32, shape=eye_num_faces)
+    eye_tri_uv_idx.from_numpy(eye_tri_uv_idx_np)
+
+    eye_uvs_field = ti.Vector.field(2, ti.f32, shape=eye_num_uvs)
+    eye_uvs_field.from_numpy(eye_uvs.astype(np.float32))
+
+    HAS_EYES = True
+    elo, ehi = eye_positions.min(axis=0), eye_positions.max(axis=0)
+    print(f"eyeballs: {eye_num_faces} tris, bounds {elo} .. {ehi}")
+except FileNotFoundError as e:
+    HAS_EYES = False
+    print(f"no eyeballs loaded ({e}); rendering head only")
 
 
 # ------------------------------------------------------- back compatibility
@@ -164,21 +239,3 @@ inner_node_right = inner["right"]
 inner_node_tri_start = inner["tri_start"]
 inner_node_tri_count = inner["tri_count"]
 inner_leaf_triangle_indices = inner["leaf_idx"]
-
-
-
-
-# ear region verts
-ear = positions[(positions[:,0] < -45) & (positions[:,1] > 175) & (positions[:,1] < 210)]
-c = ear.mean(axis=0)
-print("ear center:", c)
-
-# the ear's outward direction ≈ average vertex normal there
-en = vertex_normals[(positions[:,0] < -45) & (positions[:,1] > 175) & (positions[:,1] < 210)]
-d = en.mean(axis=0)
-d = d / np.linalg.norm(d)
-print("ear faces:", d)
-
-# camera 250mm out along that direction, light 60mm behind the ear
-print("camera pos:", c + d*250)
-print("light pos: ", c - d*60)

@@ -24,66 +24,19 @@ assert RESOLUTION == (IMG_WIDTH, IMG_HEIGHT), \
     f"traversal stack is {RESOLUTION}, render is {(IMG_WIDTH, IMG_HEIGHT)}"
 
 BATCH = 8
-NUM_BATCHES = 10000
+NUM_BATCHES = 1024
 SAVE_EVERY = 4          # writing a PNG every batch costs more than it helps
 
-# EXPOSURE = 0.03
+EXPOSURE = 0.03
 
 # camera tight on the cheek.
 # flip_y=False because ti.tools.imwrite puts row 0 at the BOTTOM; the default
 # assumes row 0 is the top, which renders the head upside down.
-# setup_camera(position=[-30, 205, 160], look=[-38, 205, 55], up=[0, 1, 0],
-#              fov=10.0, width=IMG_WIDTH, height=IMG_HEIGHT, flip_y=False)
 
-# # small light almost parallel to the skin, from the left
-# set_light(position=[-220, 195, 20], u_vec=[0, 30, 0], v_vec=[0, 0, 30],
-#           emission=[3000.0, 3000.0, 3000.0])
-
-
-#goodd
-# setup_camera(position=[0, 190, 420], look=[0, 175, 0], up=[0, 1, 0],
-#              fov=32.0, width=IMG_WIDTH, height=IMG_HEIGHT, flip_y=False)
-# set_light(position=[-90, 340, 380], u_vec=[70, 0, 0], v_vec=[0, 0, 70],
-#           emission=[9000.0, 9000.0, 9000.0])
-
-
-
-
-
-# set_light(position=[-200, 360, 300], u_vec=[70, 0, 0], v_vec=[0, 0, 70],
-#           emission=[9000.0, 9000.0, 9000.0])
-
-# ear lit
-# camera outside the left ear, looking inward
-# setup_camera(position=[-380, 200, 60], look=[-80, 195, 15], up=[0, 1, 0],
-#              fov=20.0, width=IMG_WIDTH, height=IMG_HEIGHT, flip_y=False)
-
-# set_light(position=[-105, 190, -240], u_vec=[50, 0, 0], v_vec=[0, 50, 0],
-#           emission=[8000.0, 8000.0, 8000.0])
-
-
-# setup_camera(position=[-300, 190, 90], look=[-52, 190, 13], up=[0, 1, 0],
-#              fov=16.0, width=IMG_WIDTH, height=IMG_HEIGHT, flip_y=False)
-# set_light(position=[-52, 195, -30], u_vec=[0, 35, 0], v_vec=[0, 0, 35],
-#           emission=[20000.0, 20000.0, 20000.0])
-# EXPOSURE = 0.05
-
-# setup_camera(position=[-292.7, 159.1, 65.9], look=[-49.8, 188.5, 14.1], up=[0, 1, 0],
-#              fov=15.0, width=IMG_WIDTH, height=IMG_HEIGHT, flip_y=False)
-
-# set_light(position=[-10, 192, 10], u_vec=[0, 70, 0], v_vec=[0, 0, 70],
-#           emission=[9000.0, 9000.0, 9000.0])
-# EXPOSURE = 0.15
-
-
-#test
-setup_camera(position=[-140, 205, 180], look=[-49.8, 188.5, 14.1], up=[0, 1, 0],
-             fov=13.0, width=IMG_WIDTH, height=IMG_HEIGHT, flip_y=False)
-
-# behind the ear from THIS camera = deeper into the head, toward +x/-z
-set_light(position=[-95, 190, -25], u_vec=[0, 12, 0], v_vec=[0, 0, 12],
-          emission=[5000.0, 5000.0, 5000.0])
-EXPOSURE = 0.07
+setup_camera(position=[0, 190, 420], look=[0, 175, 0], up=[0, 1, 0],
+             fov=32.0, width=IMG_WIDTH, height=IMG_HEIGHT, flip_y=False)
+set_light(position=[-90, 340, 380], u_vec=[70, 0, 0], v_vec=[0, 0, 70],
+          emission=[9000.0, 9000.0, 9000.0])
 
 color = ti.Vector.field(3, dtype=ti.f32, shape=(IMG_WIDTH, IMG_HEIGHT))
 accum_buffer = ti.Vector.field(3, dtype=ti.f32, shape=(IMG_WIDTH, IMG_HEIGHT))
@@ -92,6 +45,15 @@ load_albedo("TGA/Face/Face_Albedo.tga")
 load_roughness("TGA/Face/Face_Roughness.tga")
 load_specular("TGA/Face/Face_Specular.tga")
 load_normal("TGA/Face/Face_Normal.tga")
+
+from scene import HAS_EYES
+if HAS_EYES:
+    from eye import load_eye_textures
+    load_eye_textures(
+        "TGA/Eyes/Eyes_Balls_Diffuse.tga",
+        "TGA/Eyes/Eyes_Balls_Normals.tga",
+        "TGA/Eyes/Eyes_Balls_Roughness.tga",
+        "TGA/Eyes/Eyes_Balls_Spec.tga")
 
 
 @ti.kernel
@@ -169,6 +131,6 @@ for b in range(NUM_BATCHES):
 
     if (b + 1) % SAVE_EVERY == 0 or b == NUM_BATCHES - 1:
         finalize(done)
-        ti.tools.imwrite(color.to_numpy(), "300.png")
+        ti.tools.imwrite(color.to_numpy(), "fullface2.png")
         print(f"{done} spp   {time.time() - start:.1f}s", flush=True)
         report()

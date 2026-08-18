@@ -43,7 +43,7 @@ walk_diag = ti.field(dtype=ti.f64, shape=4)
 
 # ceiling on throughput after a pdf division. slight bias, but an unlucky
 # sample can otherwise return an enormous value and produce a firefly pixel
-MAX_THROUGHPUT = 4.0
+MAX_THROUGHPUT = 10.0
 
 # roulette only starts after this many steps, so short walks run untouched
 ROULETTE_START = 512
@@ -69,9 +69,9 @@ def to_sigma_s(mu_s_prime, g=G):
 
 
 # --- biological parameters (Table 3 ranges) ---
-MELANIN_FRACTION = 0.005
+MELANIN_FRACTION = 0.05
 MELANIN_BLEND    = 0.5
-HEMOGLOBIN_FRAC  = 0.02
+HEMOGLOBIN_FRAC  = 0.03
 
 
 sigma_a_epi_np = epidermis_absorption(MELANIN_FRACTION, MELANIN_BLEND)
@@ -358,3 +358,8 @@ def random_walk_sss(start_pos, start_dir, px, py):
         ti.atomic_add(walk_stats[3], 1)     # hard cap - real loss
 
     return pos, dir, throughput, escaped, exit_tri, exit_u, exit_v
+
+
+
+
+
