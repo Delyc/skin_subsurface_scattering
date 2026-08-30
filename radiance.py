@@ -3,24 +3,65 @@ import taichi.math as tm
 
 from helpers import environment_light
 from shading import interpolate_normal, interpolate_uv
-from texture import apply_normal_map, sample_roughness
+from texture import apply_normal_map, sample_roughness, sample_albedo
 from scene import tri_tangent, tri_handedness
 from trace import trace_outer
 from sampling import cosine_weighted_hemisphere_sample, sample_ggx
 from lighting import (direct_light_specular, direct_light_diffuse,
                       intersect_light, light_pdf_toward, power_heuristic,
-                      light_emission)
+                      light_emission_at)
 from brdf import fresnel_schlick, eval_specular_brdf, brdf_pdf
 from sss import random_walk_sss, refract_into_medium, F0_SKIN, IOR_SKIN
+from scene import HAS_EYES
+
+if HAS_EYES:
+    from trace import trace_eyeball
+    from scene import (eye_vertex_normals_field, eye_tri_vertex_idx,
+                       eye_tri_uv_idx, eye_uvs_field)
+    from eye import eval_eye_brdf, sample_eye_diffuse
+    from lighting import sample_light, shadow_ray_blocked
+
 
 MAX_BOUNCE = 8
 
-# Scene is in millimetres, so offsets are too. 1e-2 mm sits well above f32
-# resolution at the far side of a 150 mm head while staying far below any
-# feature you would see.
 SURF_EPS = 1e-2
 
-# ROUGHNESS = sample_roughness(uv)
+NERF_MATTE = False
+
+
+if HAS_EYES:
+    @ti.func
+    def eye_normal_at(tri_idx, u, v, front):
+        vi = eye_tri_vertex_idx[tri_idx]
+        n = ((1.0 - u - v) * eye_vertex_normals_field[vi[0]]
+             + u * eye_vertex_normals_field[vi[1]]
+             + v * eye_vertex_normals_field[vi[2]])
+        return tm.normalize(n) * front
+
+    @ti.func
+    def eye_uv_at(tri_idx, u, v):
+        ti_ = eye_tri_uv_idx[tri_idx]
+        return ((1.0 - u - v) * eye_uvs_field[ti_[0]]
+                + u * eye_uvs_field[ti_[1]]
+                + v * eye_uvs_field[ti_[2]])
+
+    @ti.func
+    def shade_eyeball(hit_point, tri_idx, u, v, front, wo, px, py):
+        """Direct lighting on the eyeball: opaque, diffuse + specular, no walk.
+        One NEE sample against the area light with a shadow test."""
+        n = eye_normal_at(tri_idx, u, v, front)
+        uv = eye_uv_at(tri_idx, u, v)
+
+        Ld = tm.vec3(0.0, 0.0, 0.0)
+        wi, dist, emission, pdf = sample_light(hit_point)
+        if pdf > 0.0:
+            cos_s = tm.dot(wi, n)
+            if cos_s > 0.0:
+                shadow_o = hit_point + n * SURF_EPS
+                if not shadow_ray_blocked(shadow_o, wi, dist, px, py):
+                    brdf = eval_eye_brdf(n, wi, wo, uv)
+                    Ld = emission * brdf * cos_s / pdf
+        return Ld
 
 
 @ti.func
@@ -40,15 +81,35 @@ def radiance(ray_origin, ray_dir, px, py):
     for bounce in range(MAX_BOUNCE):
         t, tri_idx, u, v, front = trace_outer(origin, direction, px, py)
 
-        # ---- did this ray hit the light on its way? (BSDF side of MIS) ----
+        # ---- eyeball: opaque, so if it is nearer than the skin the ray
+        # stops there. Shade it directly and end the path. ----
+        if ti.static(HAS_EYES):
+            et, e_tri, eu, ev, e_front = trace_eyeball(origin, direction, px, py)
+            head_t = t if tri_idx >= 0 else 1e30
+            if e_tri >= 0 and et < head_t:
+                e_hit = origin + et * direction
+                # still let a BSDF-sampled ray that grazes a light count
+                tl, hitl, which = intersect_light(origin, direction, et)
+                if hitl == 1 and bounce > 0:
+                    w = 1.0
+                    if prev_pdf > 0.0:
+                        pdf_l = light_pdf_toward(origin, direction, tl)
+                        w = power_heuristic(prev_pdf, pdf_l)
+                    L += throughput * light_emission_at(which) * w
+                else:
+                    L += throughput * shade_eyeball(
+                        e_hit, e_tri, eu, ev, e_front, -direction, px, py)
+                break
+
+        # ---- did this ray hit a light on its way? (BSDF side of MIS) ----
         surface_t = t if tri_idx >= 0 else 1e30
-        t_light, hit_light = intersect_light(origin, direction, surface_t)
-        if hit_light == 1:
+        t_light, hit_light, which_l = intersect_light(origin, direction, surface_t)
+        if hit_light == 1 and bounce > 0:
             w = 1.0
             if prev_pdf > 0.0:
                 pdf_l = light_pdf_toward(origin, direction, t_light)
                 w = power_heuristic(prev_pdf, pdf_l)
-            L += throughput * light_emission[None] * w
+            L += throughput * light_emission_at(which_l) * w
             break
 
         if tri_idx < 0:
@@ -73,11 +134,11 @@ def radiance(ray_origin, ray_dir, px, py):
         F = tm.clamp(
             fresnel_schlick(tm.max(0.0, tm.dot(wo, shading_normal)), F0_SKIN),
             0.02, 0.98)
+        if ti.static(NERF_MATTE):
+            F = 0.0   # matte skin: every ray enters the medium, no specular
 
         if ti.random(ti.f32) < F:
             # ------------------- surface reflection -------------------
-            # Dividing by the selection probability leaves eval_specular_brdf
-            # to supply the physical Fresnel; the two are not the same factor.
             throughput /= F
 
             L += throughput * direct_light_specular(
@@ -98,8 +159,7 @@ def radiance(ray_origin, ray_dir, px, py):
 
         else:
             # ------------------ subsurface scattering ------------------
-            # The physical transmission factor (1 - F) cancels exactly against
-            # the selection probability, so the net weight here is 1.
+        
             throughput /= (1.0 - F)
 
             enter_dir = refract_into_medium(direction, normal, IOR_SKIN)
@@ -111,7 +171,6 @@ def radiance(ray_origin, ray_dir, px, py):
             if escaped == 0:
                 break        # absorbed in the medium: the path ends here
 
-            # walk_tp carries the colour - melanin and haemoglobin absorption
             throughput *= walk_tp
 
             exit_normal = interpolate_normal(exit_tri, exit_u, exit_v, 1.0)
@@ -126,15 +185,11 @@ def radiance(ray_origin, ray_dir, px, py):
             if pdf <= 1e-8:
                 break
 
-            # Lambertian (1/pi) * cos / (cos/pi) == 1, so throughput is
-            # unchanged. No exit Fresnel here: random_walk_sss already spent
-            # it on the escape roulette.
-
             prev_pdf = pdf
             origin = exit_pos + exit_normal * SURF_EPS
             direction = new_dir
 
-        # ---- russian roulette: kill dim paths, scale up the survivors ----
+        # ---- russian roulette
         if bounce > 3:
             survive = tm.min(0.95, tm.max(throughput[0],
                                           tm.max(throughput[1],
@@ -145,3 +200,30 @@ def radiance(ray_origin, ray_dir, px, py):
             prev_pdf *= survive if prev_pdf > 0.0 else 1.0
 
     return L
+
+
+@ti.func
+def primary_aov(ray_origin, ray_dir, px, py):
+    """First-hit albedo and normal for the denoiser's guide buffers."""
+    albedo = tm.vec3(0.0, 0.0, 0.0)
+    nrm = tm.vec3(0.0, 0.0, 0.0)
+
+    t, tri_idx, u, v, front = trace_outer(ray_origin, ray_dir, px, py)
+    got = 0
+
+    if ti.static(HAS_EYES):
+        et, e_tri, eu, ev, e_front = trace_eyeball(ray_origin, ray_dir, px, py)
+        head_t = t if tri_idx >= 0 else 1e30
+        if e_tri >= 0 and et < head_t:
+            albedo = sample_eye_diffuse(eye_uv_at(e_tri, eu, ev))
+            nrm = eye_normal_at(e_tri, eu, ev, e_front)
+            got = 1
+
+    if got == 0 and tri_idx >= 0:
+        uv = interpolate_uv(tri_idx, u, v)
+        albedo = sample_albedo(uv)
+        n = interpolate_normal(tri_idx, u, v, front)
+        nrm = apply_normal_map(
+            uv, n, tri_tangent[tri_idx], tri_handedness[tri_idx] * front)
+
+    return albedo, nrm

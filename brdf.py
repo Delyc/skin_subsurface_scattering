@@ -53,7 +53,6 @@ def fresnel_schlick(cos_theta, f0):
 
 # energy compensation
 
-
 ESS_RES = 32
 _ESS_CACHE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                           "ggx_ess.npy")

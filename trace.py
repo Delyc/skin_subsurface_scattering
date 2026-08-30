@@ -8,6 +8,7 @@ from scene import (outer, inner, tri_vertex_idx, stack_field, STACK_MAX,
 
 SLOT_OUTER = 0
 SLOT_INNER = 1
+SLOT_EYEBALL = 2
 
 
 @ti.func
@@ -16,7 +17,8 @@ def trace(ray_origin, ray_dir, px, py, slot, t_max,
           bbox_min_f: ti.template(), bbox_max_f: ti.template(),
           left_f: ti.template(), right_f: ti.template(),
           tri_start_f: ti.template(), tri_count_f: ti.template(),
-          leaf_tri_f: ti.template()):
+          leaf_tri_f: ti.template(),
+          vidx_f: ti.template()):
     """Closest hit against one shell.
 
     Returns (t, tri_idx, u, v, front). `front` is 1 when the ray struck the
@@ -41,7 +43,7 @@ def trace(ray_origin, ray_dir, px, py, slot, t_max,
             start = tri_start_f[node_id]
             for i in range(tri_count_f[node_id]):
                 tri_idx = leaf_tri_f[start + i]
-                v_idx = tri_vertex_idx[tri_idx]
+                v_idx = vidx_f[tri_idx]
 
                 hit = ray_triangle_intersect(
                     ray_origin, ray_dir,
@@ -91,7 +93,7 @@ def trace(ray_origin, ray_dir, px, py, slot, t_max,
     # medium tracking has to follow the actual surface being crossed.
     front = 0.0
     if closest_tri >= 0:
-        v_idx = tri_vertex_idx[closest_tri]
+        v_idx = vidx_f[closest_tri]
         p0 = positions_f[v_idx[0]]
         n = tm.cross(positions_f[v_idx[1]] - p0, positions_f[v_idx[2]] - p0)
         front = -1.0 if tm.dot(n, ray_dir) > 0.0 else 1.0
@@ -104,7 +106,7 @@ def trace_outer(ray_origin, ray_dir, px, py, t_max=T_MAX):
     return trace(ray_origin, ray_dir, px, py, SLOT_OUTER, t_max,
                  outer["positions"], outer["bbox_min"], outer["bbox_max"],
                  outer["left"], outer["right"], outer["tri_start"],
-                 outer["tri_count"], outer["leaf_idx"])
+                 outer["tri_count"], outer["leaf_idx"], tri_vertex_idx)
 
 
 @ti.func
@@ -112,4 +114,20 @@ def trace_inner(ray_origin, ray_dir, px, py, t_max=T_MAX):
     return trace(ray_origin, ray_dir, px, py, SLOT_INNER, t_max,
                  inner["positions"], inner["bbox_min"], inner["bbox_max"],
                  inner["left"], inner["right"], inner["tri_start"],
-                 inner["tri_count"], inner["leaf_idx"])
+                 inner["tri_count"], inner["leaf_idx"], tri_vertex_idx)
+
+
+# Eyeball trace is guarded: the module imports cleanly even when no eye OBJs
+# are present, so the head-only path still runs.
+from scene import HAS_EYES
+
+if HAS_EYES:
+    from scene import eyeball, eye_tri_vertex_idx
+
+    @ti.func
+    def trace_eyeball(ray_origin, ray_dir, px, py, t_max=T_MAX):
+        return trace(ray_origin, ray_dir, px, py, SLOT_EYEBALL, t_max,
+                     eyeball["positions"], eyeball["bbox_min"],
+                     eyeball["bbox_max"], eyeball["left"], eyeball["right"],
+                     eyeball["tri_start"], eyeball["tri_count"],
+                     eyeball["leaf_idx"], eye_tri_vertex_idx)

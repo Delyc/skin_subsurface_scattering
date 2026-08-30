@@ -12,7 +12,7 @@ def normalize(vector):
 
 @ti.func
 def environment_light(direction):
-    return tm.vec3(0.05, 0.05, 0.05)
+    return tm.vec3(0.0, 0.0, 0.0)
 
 
 def _tri_indices(faces):
@@ -46,11 +46,6 @@ def compute_vertex_normals(positions, faces):
 
 
 def compute_tangents(positions, uvs, faces, vertex_normals=None):
-    """Per-face direction the texture U axis points in 3D (Lengyel's method).
-
-    Returns (tangents, handedness). Handedness is +1/-1 per face and is needed
-    wherever the unwrap is mirrored, which on a head it almost always is across
-    the centre line. Reconstruct the bitangent as handedness * cross(N, T)."""
     n_faces = len(faces)
     tangents = np.zeros((n_faces, 3), dtype=np.float32)
     handedness = np.ones(n_faces, dtype=np.float32)
@@ -94,8 +89,6 @@ def compute_tangents(positions, uvs, faces, vertex_normals=None):
 
 
 def find_boundary_edges(faces):
-    """Directed edges used by exactly one triangle: the rim of a hole.
-    Direction is preserved so caps can be wound consistently."""
     assert all(len(f) == 3 for f in faces), "triangulate first"
     count = {}
     directed = {}
@@ -111,11 +104,6 @@ def find_boundary_edges(faces):
 
 
 def boundary_loops(boundary):
-    """Split a flat list of boundary edges into separate closed loops.
-
-    A head has several holes - neck, and usually the eye sockets and the
-    inside of the mouth. Capping them all to one shared centre vertex would
-    staple the neck to the eyeballs."""
     adjacency = {}
     for a, b in boundary:
         adjacency.setdefault(a, []).append((a, b))
@@ -151,12 +139,6 @@ def boundary_center(positions, boundary):
 
 
 def cap_boundary(positions, uvs, faces, boundary, center):
-    """Fan-fill a hole from a new centre vertex.
-
-    Each boundary edge runs a->b inside its single triangle, so the cap
-    triangle is wound b->a->centre to face the same way as the surrounding
-    surface. Getting this backwards makes half the cap point inward, and
-    an SSS ray cannot then tell inside from outside."""
     positions = np.vstack([positions, center.astype(np.float32)])
     center_idx = len(positions) - 1
 
@@ -181,8 +163,6 @@ def cap_boundary(positions, uvs, faces, boundary, center):
 
 
 def close_mesh(positions, uvs, faces, verbose=True):
-    """Cap every hole. Repeats until no boundary edges remain, since a head
-    typically has several: neck, and often the eye sockets and mouth bag."""
     boundary = find_boundary_edges(faces)
     loops = boundary_loops(boundary)
 
@@ -206,8 +186,6 @@ def is_closed(faces):
 
 
 def signed_volume(positions, faces):
-    """Positive means outward-facing winding. Meaningful only on a closed
-    mesh; a negative result means the whole surface is inside out."""
     idx = _tri_indices(faces)
     p = positions[idx]
     return float(np.einsum("ij,ij->i",

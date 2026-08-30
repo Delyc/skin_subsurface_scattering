@@ -21,8 +21,11 @@ specular_field = ti.field(dtype=TEX_DTYPE, shape=(TEX_SIZE, TEX_SIZE))
 
 
 # ------------------------------------------------------------------ loading
-def _read(path, channels):
-    """Read an image to float in [0, 1], honouring the source bit depth."""
+def _read(path, channels, expect_size=None):
+    """Read an image to float in [0, 1], honouring the source bit depth.
+
+    expect_size defaults to TEX_SIZE for face maps; pass None (the eye path
+    does) to skip the check when the caller will resize the image itself."""
     img = iio.imread(path)
 
     if img.dtype == np.uint8:
@@ -36,8 +39,12 @@ def _read(path, channels):
         img = img[:, :, None]
     img = img[:, :, :channels] if channels > 1 else img[:, :, 0]
 
-    expected = (TEX_SIZE, TEX_SIZE, channels) if channels > 1 else (TEX_SIZE, TEX_SIZE)
-    assert img.shape == expected, f"{path}: got {img.shape}, want {expected}"
+    if expect_size is None:
+        expect_size = TEX_SIZE
+    if expect_size:
+        expected = ((expect_size, expect_size, channels) if channels > 1
+                    else (expect_size, expect_size))
+        assert img.shape == expected, f"{path}: got {img.shape}, want {expected}"
     return img
 
 
