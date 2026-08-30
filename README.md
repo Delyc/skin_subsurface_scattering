@@ -50,7 +50,7 @@ reconstruction-ready dataset. This is the core loop behind training data for mod
 
 | Noisy (low spp) | Denoised (albedo+normal guided) |
 |---|---|
-| ![noisy](docs/noisy.png) | ![denoised](docs/denoised.png) |
+| ![noisy](test_dark.png) | ![denoised](test_denoised_dark.png) |
 
 ---
 
