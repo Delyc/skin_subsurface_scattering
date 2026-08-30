@@ -69,9 +69,9 @@ def to_sigma_s(mu_s_prime, g=G):
 
 
 # --- biological parameters (Table 3 ranges) ---
-MELANIN_FRACTION = 0.40
-MELANIN_BLEND    = 0.8
-HEMOGLOBIN_FRAC  = 0.02
+MELANIN_FRACTION = 0.10
+MELANIN_BLEND    = 0.6
+HEMOGLOBIN_FRAC  = 0.025
 
 
 sigma_a_epi_np = epidermis_absorption(MELANIN_FRACTION, MELANIN_BLEND)

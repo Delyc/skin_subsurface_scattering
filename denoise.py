@@ -7,13 +7,7 @@ import oidn
 
 
 def denoise(color, albedo=None, normal=None, hdr=True):
-    """Denoise a rendered image with Intel Open Image Denoise.
-
-    color, albedo, normal are (H, W, 3) float32 arrays. albedo and normal are
-    the noise-free guide buffers from primary_aov: passing them keeps real
-    detail (pores, iris, edges) that a colour-only denoise would smear. hdr
-    should be True for un-tonemapped linear radiance, which is what the
-    accumulation buffer holds - denoise before tonemapping, not after."""
+    """Denoise a rendered image with Intel Open Image Denoise."""
     color = np.ascontiguousarray(color, dtype=np.float32)
     h, w, _ = color.shape
     out = np.zeros_like(color)

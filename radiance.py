@@ -9,7 +9,7 @@ from trace import trace_outer
 from sampling import cosine_weighted_hemisphere_sample, sample_ggx
 from lighting import (direct_light_specular, direct_light_diffuse,
                       intersect_light, light_pdf_toward, power_heuristic,
-                      light_emission)
+                      light_emission_at)
 from brdf import fresnel_schlick, eval_specular_brdf, brdf_pdf
 from sss import random_walk_sss, refract_into_medium, F0_SKIN, IOR_SKIN
 from scene import HAS_EYES
@@ -21,14 +21,12 @@ if HAS_EYES:
     from eye import eval_eye_brdf, sample_eye_diffuse
     from lighting import sample_light, shadow_ray_blocked
 
+
 MAX_BOUNCE = 8
 
-# Scene is in millimetres, so offsets are too. 1e-2 mm sits well above f32
-# resolution at the far side of a 150 mm head while staying far below any
-# feature you would see.
 SURF_EPS = 1e-2
 
-# ROUGHNESS = sample_roughness(uv)
+NERF_MATTE = False
 
 
 if HAS_EYES:
@@ -90,28 +88,28 @@ def radiance(ray_origin, ray_dir, px, py):
             head_t = t if tri_idx >= 0 else 1e30
             if e_tri >= 0 and et < head_t:
                 e_hit = origin + et * direction
-                # still let a BSDF-sampled ray that grazes the light count
-                tl, hitl = intersect_light(origin, direction, et)
-                if hitl == 1:
+                # still let a BSDF-sampled ray that grazes a light count
+                tl, hitl, which = intersect_light(origin, direction, et)
+                if hitl == 1 and bounce > 0:
                     w = 1.0
                     if prev_pdf > 0.0:
                         pdf_l = light_pdf_toward(origin, direction, tl)
                         w = power_heuristic(prev_pdf, pdf_l)
-                    L += throughput * light_emission[None] * w
+                    L += throughput * light_emission_at(which) * w
                 else:
                     L += throughput * shade_eyeball(
                         e_hit, e_tri, eu, ev, e_front, -direction, px, py)
                 break
 
-        # ---- did this ray hit the light on its way? (BSDF side of MIS) ----
+        # ---- did this ray hit a light on its way? (BSDF side of MIS) ----
         surface_t = t if tri_idx >= 0 else 1e30
-        t_light, hit_light = intersect_light(origin, direction, surface_t)
-        if hit_light == 1:
+        t_light, hit_light, which_l = intersect_light(origin, direction, surface_t)
+        if hit_light == 1 and bounce > 0:
             w = 1.0
             if prev_pdf > 0.0:
                 pdf_l = light_pdf_toward(origin, direction, t_light)
                 w = power_heuristic(prev_pdf, pdf_l)
-            L += throughput * light_emission[None] * w
+            L += throughput * light_emission_at(which_l) * w
             break
 
         if tri_idx < 0:
@@ -136,11 +134,11 @@ def radiance(ray_origin, ray_dir, px, py):
         F = tm.clamp(
             fresnel_schlick(tm.max(0.0, tm.dot(wo, shading_normal)), F0_SKIN),
             0.02, 0.98)
+        if ti.static(NERF_MATTE):
+            F = 0.0   # matte skin: every ray enters the medium, no specular
 
         if ti.random(ti.f32) < F:
             # ------------------- surface reflection -------------------
-            # Dividing by the selection probability leaves eval_specular_brdf
-            # to supply the physical Fresnel; the two are not the same factor.
             throughput /= F
 
             L += throughput * direct_light_specular(
@@ -161,8 +159,7 @@ def radiance(ray_origin, ray_dir, px, py):
 
         else:
             # ------------------ subsurface scattering ------------------
-            # The physical transmission factor (1 - F) cancels exactly against
-            # the selection probability, so the net weight here is 1.
+        
             throughput /= (1.0 - F)
 
             enter_dir = refract_into_medium(direction, normal, IOR_SKIN)
@@ -174,7 +171,6 @@ def radiance(ray_origin, ray_dir, px, py):
             if escaped == 0:
                 break        # absorbed in the medium: the path ends here
 
-            # walk_tp carries the colour - melanin and haemoglobin absorption
             throughput *= walk_tp
 
             exit_normal = interpolate_normal(exit_tri, exit_u, exit_v, 1.0)
@@ -189,15 +185,11 @@ def radiance(ray_origin, ray_dir, px, py):
             if pdf <= 1e-8:
                 break
 
-            # Lambertian (1/pi) * cos / (cos/pi) == 1, so throughput is
-            # unchanged. No exit Fresnel here: random_walk_sss already spent
-            # it on the escape roulette.
-
             prev_pdf = pdf
             origin = exit_pos + exit_normal * SURF_EPS
             direction = new_dir
 
-        # ---- russian roulette: kill dim paths, scale up the survivors ----
+        # ---- russian roulette
         if bounce > 3:
             survive = tm.min(0.95, tm.max(throughput[0],
                                           tm.max(throughput[1],
@@ -212,11 +204,7 @@ def radiance(ray_origin, ray_dir, px, py):
 
 @ti.func
 def primary_aov(ray_origin, ray_dir, px, py):
-    """First-hit albedo and normal for the denoiser's guide buffers.
-
-    Noise-free by construction: one trace, no lighting, no walk. OIDN uses
-    them to tell a real edge from Monte Carlo noise, keeping pores and the
-    iris sharp instead of smeared. Both zero on a miss (background)."""
+    """First-hit albedo and normal for the denoiser's guide buffers."""
     albedo = tm.vec3(0.0, 0.0, 0.0)
     nrm = tm.vec3(0.0, 0.0, 0.0)
 

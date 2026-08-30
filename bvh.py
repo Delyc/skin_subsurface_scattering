@@ -121,9 +121,9 @@ if __name__ == "__main__":
     positions, uvs, tris, flat = build_from_obj("head.obj")
     node_min, node_max, left, right, tri_start, tri_count, leaf_idx = flat
 
-    print(f"verts     {positions.shape}")
-    print(f"uvs       {uvs.shape}")
-    print(f"tris      {len(tris)}")
-    print(f"nodes     {len(node_min)}  (leaves {(tri_count > 0).sum()})")
-    print(f"leaf idx  {len(leaf_idx)}  (must equal tris)")
-    print(f"bbox      {node_min[0]}  {node_max[0]}")
+    print(f"verts {positions.shape}")
+    print(f"uvs {uvs.shape}")
+    print(f"tris {len(tris)}")
+    print(f"nodes {len(node_min)}  (leaves {(tri_count > 0).sum()})")
+    print(f"leaf idx {len(leaf_idx)}  (must equal tris)")
+    print(f"bbox {node_min[0]}  {node_max[0]}")

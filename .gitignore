@@ -2,3 +2,5 @@ __pycache__/
 *.pyc
 TGA/
 Displacement/
+nerf/
+nerf_dark/

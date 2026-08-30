@@ -3,8 +3,6 @@ import os
 import numpy as np
 import taichi as ti
 
-# This module creates fields at import time, so the runtime must already be
-# up. Guarding here means import order can't silently break the build.
 if ti.lang.impl.get_runtime().prog is None:
     ti.init(arch=ti.gpu if ti._lib.core.with_cuda() else ti.cpu)
 
@@ -29,8 +27,7 @@ positions, uvs, faces = load_obj("Head.obj")
 positions = positions * MM_PER_UNIT
 faces = triangulate_faces(faces)
 
-# Subsurface rays would walk out through any hole and hit nothing, so seal
-# the mesh before deriving anything from it. Each loop gets its own centre.
+
 positions, uvs, faces = close_mesh(positions, uvs, faces)
 
 volume = signed_volume(positions, faces)

@@ -6,9 +6,6 @@ from texture import _read, srgb_to_linear, TEX_DTYPE, _NP_DTYPE, _texel_coords
 from brdf import (ggx_distribution, smith_visibility, fresnel_schlick,
                   smith_g1)
 
-# Eyeballs get their own textures at their own resolution. The scan ships an
-# 8192 set like the face, but the eye only occupies a small patch of screen,
-# so a smaller map is plenty and saves memory.
 import os as _oo; EYE_TEX = int(_oo.environ.get("EYE_TEX",4096))
 
 eye_diffuse = ti.Vector.field(3, dtype=TEX_DTYPE, shape=(EYE_TEX, EYE_TEX))
@@ -16,16 +13,11 @@ eye_normal = ti.Vector.field(3, dtype=TEX_DTYPE, shape=(EYE_TEX, EYE_TEX))
 eye_roughness = ti.field(dtype=TEX_DTYPE, shape=(EYE_TEX, EYE_TEX))
 eye_specular = ti.field(dtype=TEX_DTYPE, shape=(EYE_TEX, EYE_TEX))
 
-# The cornea/sclera interface is a stronger dielectric than skin: IOR ~1.376
-# gives F0 = ((1.376-1)/(1.376+1))^2 = 0.025, but the wet tear film on top
-# reads closer to water, so eyes catch a brighter, tighter highlight than skin.
+
 EYE_F0 = 0.025
 
 
 def _resize_to(img, n):
-    """Nearest-neighbour resize so an 8192 source map fits the eye field.
-    Nearest is fine here - the eye texture is low frequency and the map is
-    already oversized for the screen area an eye covers."""
     h, w = img.shape[:2]
     if (h, w) == (n, n):
         return img
@@ -78,9 +70,6 @@ def sample_eye_roughness(uv):
 
 @ti.func
 def eval_eye_brdf(n, wi, wo, uv):
-    """Diffuse iris/sclera colour plus one specular lobe. No subsurface walk:
-    the eyeball is opaque and the interesting transport happens on its
-    surface, not inside it. Returns the full BRDF value (diffuse + spec)."""
     cos_i = tm.max(0.0, tm.dot(n, wi))
     cos_o = tm.max(0.0, tm.dot(n, wo))
 

@@ -1,11 +1,6 @@
-
-
 import os
 import time
 
-# Resolution has to be set before scene.py is imported: the per-pixel BVH
-# traversal stack is allocated from it, and a render larger than the stack
-# writes out of bounds on every ray.
 IMG_WIDTH = 400
 IMG_HEIGHT = 400
 os.environ.setdefault("RENDER_W", str(IMG_WIDTH))
@@ -17,7 +12,7 @@ import taichi.math as tm
 
 from camera import setup_camera, sample_ray_through_pixel
 from texture import (load_albedo, load_roughness, load_specular, load_normal)
-from lighting import set_light
+from lighting import set_lights
 from radiance import radiance, primary_aov
 from sss import walk_stats, walk_rgb, walk_tir, walk_diag
 from scene import overflow_count, RESOLUTION
@@ -26,25 +21,32 @@ assert RESOLUTION == (IMG_WIDTH, IMG_HEIGHT), \
     f"traversal stack is {RESOLUTION}, render is {(IMG_WIDTH, IMG_HEIGHT)}"
 
 BATCH = 8
-NUM_BATCHES = 16
-SAVE_EVERY = 4          # writing a PNG every batch costs more than it helps
+NUM_BATCHES = 256
+SAVE_EVERY = 4        
 
-EXPOSURE = 0.05
+EXPOSURE = 0.02
 
-# camera tight on the cheek.
-# flip_y=False because ti.tools.imwrite puts row 0 at the BOTTOM; the default
-# assumes row 0 is the top, which renders the head upside down.
 
 setup_camera(position=[0, 190, 420], look=[0, 175, 0], up=[0, 1, 0],
              fov=32.0, width=IMG_WIDTH, height=IMG_HEIGHT, flip_y=False)
-set_light(position=[-90, 340, 380], u_vec=[70, 0, 0], v_vec=[0, 0, 70],
-          emission=[9000.0, 9000.0, 9000.0])
+
+_KEY = [1000.0, 1000.0, 1000.0]
+set_lights([
+    {"position": [-300, 205, 160], "u_vec": [0, 130, 0], "v_vec": [0, 0, 130],
+     "emission": _KEY},                                    # left
+    {"position": [300, 205, 160],  "u_vec": [0, 130, 0], "v_vec": [0, 0, 130],
+     "emission": _KEY},                                    # right
+    {"position": [0, 205, -320],   "u_vec": [130, 0, 0], "v_vec": [0, 130, 0],
+     "emission": _KEY},                                    # back
+    {"position": [0, 460, 140],    "u_vec": [130, 0, 0], "v_vec": [0, 0, 130],
+     "emission": _KEY},                                    # top
+])
+
 
 color = ti.Vector.field(3, dtype=ti.f32, shape=(IMG_WIDTH, IMG_HEIGHT))
 accum_buffer = ti.Vector.field(3, dtype=ti.f32, shape=(IMG_WIDTH, IMG_HEIGHT))
 
-# Guide buffers for the denoiser. albedo and normal are noise-free (one
-# primary trace, no lighting), so they only need to be filled once.
+
 albedo_buffer = ti.Vector.field(3, dtype=ti.f32, shape=(IMG_WIDTH, IMG_HEIGHT))
 normal_buffer = ti.Vector.field(3, dtype=ti.f32, shape=(IMG_WIDTH, IMG_HEIGHT))
 
@@ -107,8 +109,7 @@ def finalize(total_samples: ti.i32):
         color[px, py] = tm.clamp(linear_to_srgb(tm.max(c, 0.0)), 0.0, 1.0)
 
 
-# Exposure-scaled linear radiance, for the denoiser (which wants HDR linear,
-# not the tonemapped sRGB). Denoise this, THEN tonemap the clean result.
+
 linear_buffer = ti.Vector.field(3, dtype=ti.f32, shape=(IMG_WIDTH, IMG_HEIGHT))
 
 
@@ -119,8 +120,6 @@ def extract_linear(total_samples: ti.i32):
 
 
 def tonemap_np(lin):
-    """Reinhard + sRGB on a numpy array, matching finalize() but applied to the
-    already-denoised linear image."""
     lum = (0.2126 * lin[..., 0] + 0.7152 * lin[..., 1]
            + 0.0722 * lin[..., 2])[..., None]
     c = np.maximum(lin / (1.0 + lum), 0.0)
@@ -130,11 +129,7 @@ def tonemap_np(lin):
 
 
 def report():
-    """The walk statistics are the only way to see energy quietly vanishing.
-
-    walk_stats[3] is the one that matters: those walks hit MAX_WALK_STEPS and
-    their energy is simply dropped. Roulette kills (index 1) are unbiased and
-    cost nothing but noise."""
+    """The walk statistics are the only way to see energy quietly vanishing."""
     escaped, roulette, lost, capped = (int(walk_stats[i]) for i in range(4))
     total = max(escaped + roulette + lost + capped, 1)
 
@@ -177,13 +172,12 @@ for b in range(NUM_BATCHES):
 
     if (b + 1) % SAVE_EVERY == 0 or b == NUM_BATCHES - 1:
         finalize(done)
-        ti.tools.imwrite(color.to_numpy(), "test_dark2.png")
+        ti.tools.imwrite(color.to_numpy(), "light.png")
         print(f"{done} spp   {time.time() - start:.1f}s", flush=True)
         report()
 
 # ---- denoise the final frame ----
-# Denoise linear radiance guided by the albedo/normal buffers, then tonemap
-# the clean result. Denoising after tonemapping crushes highlights.
+
 import numpy as np
 from denoise import denoise
 
@@ -191,5 +185,5 @@ extract_linear(NUM_BATCHES * BATCH)
 lin = linear_buffer.to_numpy()
 
 clean = denoise(lin, albedo=albedo_np, normal=normal_np, hdr=True)
-ti.tools.imwrite(tonemap_np(clean), "test_denoised_dark2.png")
+ti.tools.imwrite(tonemap_np(clean), "light.png")
 print("wrote test_denoised.png", flush=True)
